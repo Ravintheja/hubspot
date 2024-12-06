@@ -263,7 +263,7 @@ const processContacts = async (domain, hubId, q) => {
 };
 
 /**
- * Get recently modified meetings as 100 meetings per page
+ * Get recently modified meetings as 100 meetings per page, including attendee emails.
  */
 const processMeetings = async (domain, hubId, q) => {
   const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
@@ -313,22 +313,54 @@ const processMeetings = async (domain, hubId, q) => {
 
     console.log('fetch meeting batch');
 
+    // Fetch associations for meetings
+    const meetingIds = data.map(meeting => meeting.id);
+    const meetingAssociationsResults = (await (await hubspotClient.apiRequest({
+      method: 'post',
+      path: '/crm/v3/associations/ENGAGEMENTS/CONTACTS/batch/read',
+      body: { inputs: meetingIds.map(id => ({ id })) }
+    })).json())?.results || [];
+
+    const meetingToContactMap = Object.fromEntries(
+      meetingAssociationsResults.map(assoc => [assoc.from.id, assoc.to[0]?.id])
+    );
+
+    // Fetch contact emails for associated contact IDs
+    const contactIds = Object.values(meetingToContactMap).filter(Boolean);
+    const contactDetailsResults = (await (await hubspotClient.apiRequest({
+      method: 'post',
+      path: '/crm/v3/objects/contacts/batch/read',
+      body: { inputs: contactIds.map(id => ({ id })), properties: ['email'] }
+    })).json())?.results || [];
+
+    const contactIdToEmailMap = Object.fromEntries(
+      contactDetailsResults.map(contact => [contact.id, contact.properties.email])
+    );
+
     data.forEach(meeting => {
       if (!meeting.properties) return;
 
       const isCreated = new Date(meeting.createdAt) > lastPulledDate;
+      const contactId = meetingToContactMap[meeting.id];
+      const contactEmail = contactIdToEmailMap[contactId];
 
+      if (!contactEmail) return;
+
+      // Meeting properties
       const meetingProperties = {
         meeting_title: meeting.properties.hs_meeting_title,
         meeting_start_time: new Date(meeting.properties.hs_meeting_start_time),
         meeting_end_time: new Date(meeting.properties.hs_meeting_end_time),
+        contact_email: contactEmail // Store the attendee's email
       };
 
+      // Action Template
       const actionTemplate = {
         includeInAnalytics: 0,
         meetingProperties: filterNullValuesFromObject(meetingProperties),
       };
 
+      // Push actions
       q.push({
         actionName: isCreated ? 'Meeting Created' : 'Meeting Updated',
         actionDate: new Date(isCreated ? meeting.createdAt : meeting.updatedAt),
